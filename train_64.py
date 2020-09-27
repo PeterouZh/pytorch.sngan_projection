@@ -444,7 +444,7 @@ def main():
                 summary_d['IS_mean_tf'] = IS_mean_tf
                 summary_d['IS_std_tf'] = IS_std_tf
                 summary_dict2txtfig(summary_d, prefix='train', step=n_iter, textlogger=global_textlogger)
-
+            gen.train()
     if args.test:
         shutil.rmtree(args.results_root)
 
