@@ -2,10 +2,12 @@
 # Again, this script has a lot of bugs everywhere.
 import argparse
 import datetime
+import importlib
 import json
 import os
 import shutil
 
+import logging
 import numpy as np
 import torch
 import torch.utils.data as data
@@ -15,6 +17,7 @@ import torchvision
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 import tqdm
+import math
 
 import evaluation
 import losses as L
@@ -24,6 +27,9 @@ from models.generators.resnet64 import ResNetGenerator
 from models import inception
 import utils
 
+from template_lib.v2.config import update_parser_defaults_from_yaml, global_cfg
+from template_lib.v2.GAN.evaluation import build_GAN_metric, tf_FID_IS_score
+from template_lib.v2.logger import global_textlogger, summary_dict2txtfig
 
 # Copied from https://github.com/naoto0804/pytorch-AdaIN/blob/master/sampler.py#L5-L15
 def InfiniteSampler(n):
@@ -61,8 +67,9 @@ def prepare_results_dir(args):
         args.eval_interval = 10
         args.n_fid_images = 100
         args.n_eval_batches = 10
-    root = os.path.join(args.results_root, "cGAN" if args.cGAN else "SNGAN",
-                        datetime.datetime.now().strftime('%y%m%d_%H%M'))
+    # root = os.path.join(args.results_root, "cGAN" if args.cGAN else "SNGAN",
+    #                     datetime.datetime.now().strftime('%y%m%d_%H%M'))
+    root = args.results_root
     os.makedirs(root, exist_ok=True)
     if not args.no_tensorboard:
         from tensorboardX import SummaryWriter
@@ -179,6 +186,9 @@ def get_args():
                         help='Generator and optimizer checkpoint path. default: None')
     parser.add_argument('--dis_ckpt_path', '-dcp', default=None,
                         help='Discriminator and optimizer checkpoint path. default: None')
+
+
+    update_parser_defaults_from_yaml(parser)
     args = parser.parse_args()
     return args
 
@@ -232,6 +242,7 @@ def sample_from_gen(args, device, num_classes, gen):
 
 
 def main():
+    logger = logging.getLogger('tl')
     args = get_args()
     # CUDA setting
     if not torch.cuda.is_available():
@@ -249,16 +260,18 @@ def main():
         return torch.empty_like(img, dtype=img.dtype).uniform_(0.0, 1/128.0) + img
 
     # dataset
-    train_dataset = datasets.ImageFolder(
-        os.path.join(args.data_root, 'train'),
-        transforms.Compose([
+    dataset_cfg = global_cfg.get('dataset_cfg', {})
+    dataset_module = dataset_cfg.get('dataset_module', 'datasets.ImageFolder')
+
+    train_dataset = eval(dataset_module)(
+        os.path.join(args.data_root),
+        transform=transforms.Compose([
             transforms.ToTensor(), _rescale, _noise_adder,
-        ])
-    )
+        ]), **dataset_cfg.get('dataset_kwargs', {}))
     train_loader = iter(data.DataLoader(
         train_dataset, args.batch_size,
         sampler=InfiniteSamplerWrapper(train_dataset),
-        num_workers=args.num_workers, pin_memory=True)
+        num_workers=args.num_workers, pin_memory=False)
     )
     if args.calc_FID:
         eval_dataset = datasets.ImageFolder(
@@ -282,10 +295,15 @@ def main():
     args, writer = prepare_results_dir(args)
     # initialize models.
     _n_cls = num_classes if args.cGAN else 0
-    gen = ResNetGenerator(
+
+    gen_module = getattr(global_cfg.generator, 'module', 'pytorch_sngan_projection_lib.models.generators.resnet64')
+    model_module = importlib.import_module(gen_module)
+
+    gen = model_module.ResNetGenerator(
         args.gen_num_features, args.gen_dim_z, args.gen_bottom_width,
         activation=F.relu, num_classes=_n_cls, distribution=args.gen_distribution
     ).to(device)
+
     if args.dis_arch_concat:
         dis = SNResNetConcatDiscriminator(
             args.dis_num_features, _n_cls, F.relu, args.dis_emb).to(device)
@@ -308,6 +326,29 @@ def main():
         prev_args, gen, opt_gen, dis, opt_dis = utils.resume_from_args(
             args.args_path, args.gen_ckpt_path, args.dis_ckpt_path
         )
+
+    # tf FID
+    tf_FID = build_GAN_metric(cfg=global_cfg.GAN_metric)
+
+    class SampleFunc(object):
+        def __init__(self, generator, batch, latent, gen_distribution, device):
+            self.generator = generator
+            self.batch = batch
+            self.latent = latent
+            self.gen_distribution = gen_distribution
+            self.device = device
+            pass
+
+        def __call__(self, *args, **kwargs):
+            with torch.no_grad():
+                self.generator.eval()
+                z = utils.sample_z(self.batch, self.latent, self.device, self.gen_distribution)
+                pseudo_y = utils.sample_pseudo_labels(num_classes, self.batch, self.device)
+                fake_img = self.generator(z, pseudo_y)
+            return fake_img
+
+    sample_func = SampleFunc(gen, batch=args.batch_size, latent=args.gen_dim_z,
+                             gen_distribution=args.gen_distribution, device=device)
 
     # Training loop
     for n_iter in tqdm.tqdm(range(1, args.max_iteration + 1)):
@@ -353,7 +394,7 @@ def main():
                 writer.add_scalar('dis', cumulative_loss_dis / args.n_dis, n_iter)
         # ==================== End of 1 iteration. ====================
 
-        if n_iter % args.log_interval == 0:
+        if n_iter % args.log_interval == 0 or n_iter == 1:
             tqdm.tqdm.write(
                 'iteration: {:07d}/{:07d}, loss gen: {:05f}, loss dis {:05f}'.format(
                     n_iter, args.max_iteration, _l_g, cumulative_loss_dis))
@@ -375,7 +416,7 @@ def main():
                 args, n_iter, n_iter // args.checkpoint_interval,
                 gen, opt_gen, dis, opt_dis
             )
-        if n_iter % args.eval_interval == 0:
+        if (n_iter % args.eval_interval == 0 or n_iter == 1) and eval_loader is not None:
             # TODO (crcrpar): implement Ineption score, FID, and Geometry score
             # Once these criterion are prepared, val_loader will be used.
             fid_score = evaluation.evaluate(
@@ -394,6 +435,16 @@ def main():
                         list(range(args.num_classes)),
                         global_step=n_iter
                     )
+        if n_iter % global_cfg.eval_FID_every == 0 or n_iter == 1:
+            FID_tf, IS_mean_tf, IS_std_tf = tf_FID(sample_func=sample_func)
+            logger.info(f'IS_mean_tf:{IS_mean_tf:.3f} +- {IS_std_tf:.3f}\n\tFID_tf: {FID_tf:.3f}')
+            if not math.isnan(IS_mean_tf):
+                summary_d = {}
+                summary_d['FID_tf'] = FID_tf
+                summary_d['IS_mean_tf'] = IS_mean_tf
+                summary_d['IS_std_tf'] = IS_std_tf
+                summary_dict2txtfig(summary_d, prefix='train', step=n_iter, textlogger=global_textlogger)
+
     if args.test:
         shutil.rmtree(args.results_root)
 
